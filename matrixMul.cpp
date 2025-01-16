@@ -10,10 +10,6 @@ using namespace std;
 
 #define SCALAR_T float
 
-// #define BLOCKDIM1 DIM1
-// #define BLOCKDIM2 1
-// #define BLOCKDIM3 1
-
 #define THREADS_PER_BLOCKDIM 32
 
 

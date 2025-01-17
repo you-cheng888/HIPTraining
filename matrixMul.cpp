@@ -1,6 +1,5 @@
 #include <stdio.h>
 #include <hip/hip_runtime.h>
-// #include <random>
 #include <iostream>
 using namespace std;
 
@@ -107,6 +106,49 @@ __global__ void matrixMul_colMajor_tiledKernel(T* A, T* B, T* C, size_t dim_1, s
     }
 }
 
+template<typename T>
+__global__ void matrixMul_colMajor_tiledKernel2(T* A, T* B, T* C, size_t dim_1, size_t dim_2, size_t dim_3) {
+    // Size of shared memory = 2 * size of tile matrix * sizeof(T) (bytes)
+    //                       = 2 * (32*32) * 4 = 8192, for THREADS_PER_BLOCKDIM == 32 and float type.
+    // For MI210, the maximum shared memory per block is 65536 bytes, the allocation of shared memory is valid.
+    __shared__ T tileA[THREADS_PER_BLOCKDIM][THREADS_PER_BLOCKDIM];
+    __shared__ T tileB[THREADS_PER_BLOCKDIM][THREADS_PER_BLOCKDIM];
+    int j = blockDim.y * blockIdx.y + threadIdx.y;
+    int i = blockDim.x * blockIdx.x + threadIdx.x;
+    //printf(" blockIdx.y = %d, blockIdx.x = %d, threadIdx.y = %d, threadIdx.x = %d, i = %d, j = %d, blockDim.y = %d, blockDim.x = %d, gridDim.y = %d, gridDim.x = %d\n", blockIdx.y, blockIdx.x, threadIdx.y, threadIdx.x, i, j, blockDim.y, blockDim.x, gridDim.y, gridDim.x);
+
+    T sum = 0;
+    for (int t = 0; t < ((dim_2+THREADS_PER_BLOCKDIM-1)/THREADS_PER_BLOCKDIM); t++) {
+        // Update tileA
+        if ((i < dim_1) && ((t*THREADS_PER_BLOCKDIM + threadIdx.x) < dim_2)) {
+            tileA[threadIdx.y][threadIdx.x] = A[i + (t*THREADS_PER_BLOCKDIM + threadIdx.x)*dim_1];
+        } else {
+            tileA[threadIdx.y][threadIdx.x] = 0.0;
+        }
+
+        // Update tileB
+        if (((t*THREADS_PER_BLOCKDIM + threadIdx.y) < dim_2) && (j < dim_3)) {
+            tileB[threadIdx.y][threadIdx.x] = B[(t*THREADS_PER_BLOCKDIM+threadIdx.y) + j*dim_2];
+        } else {
+            tileB[threadIdx.y][threadIdx.x] = 0.0;
+        }
+
+        // Wait all threads in the same block have copied the value from global memory.
+        __syncthreads();
+        
+        // Calculate tileA*tileB
+        for (int k = 0; k < THREADS_PER_BLOCKDIM; k++) {
+            sum += tileA[threadIdx.y][k] * tileB[k][threadIdx.x];
+        }
+
+        // Before change tileA and tileB to other submatrix of A and B, we need to wait all threads in the block have completed the correlation.
+        __syncthreads();
+    }
+    if (i < dim_1 && j < dim_3) {
+        C[i + j * dim_1] = sum;
+    }
+}
+
 
 template<typename T>
 __global__ void matrixMul_rowMajor_kernel(T* A, T* B, T* C, size_t dim_1, size_t dim_2, size_t dim_3) {
@@ -123,9 +165,26 @@ __global__ void matrixMul_rowMajor_kernel(T* A, T* B, T* C, size_t dim_1, size_t
 
 template<typename T>
 __global__ void matrixMul_colMajor_kernel(T* A, T* B, T* C, size_t dim_1, size_t dim_2, size_t dim_3) {
+    // Memory Coalescing : Read B
+    // Memory NonCoalescing : Read A, Write C
     int i = blockDim.y * blockIdx.y + threadIdx.y;          // row
     int j = blockDim.x * blockIdx.x + threadIdx.x;          // col
     if (i < dim_1  && j < dim_3) {
+        T sum = 0;
+        for (int k = 0; k < dim_2; k++) {
+            sum += A[i + k*dim_1] * B[k + j*dim_2];
+        }
+        C[i + j*dim_1] = sum;
+    }
+}
+
+template<typename T>
+__global__ void matrixMul_colMajor_kernel2(T* A, T* B, T* C, size_t dim_1, size_t dim_2, size_t dim_3) {
+    // Memory Coalescing : Read B, Write C
+    // Memory NonCoalescing : Read A
+    int j = blockDim.y * blockIdx.y + threadIdx.y;          // row
+    int i = blockDim.x * blockIdx.x + threadIdx.x;          // col
+    if (i < dim_3  && j < dim_1) {
         T sum = 0;
         for (int k = 0; k < dim_2; k++) {
             sum += A[i + k*dim_1] * B[k + j*dim_2];
@@ -260,7 +319,7 @@ int main() {
 
     // Matrix Multiplication from Host
     int major = COLMAJOR;
-    int type  = ELE_PARTITION;     // ELE_PARTITION, TILE_PARTITION
+    int type  = TILE_PARTITION;     // ELE_PARTITION, TILE_PARTITION
     if (major == ROWMAJOR) cout << "Treat as row major matrix" << endl; else cout << "Treat as column major matrix" << endl;
     if (type == ELE_PARTITION) cout << "Element wise partitioning..." << endl;
     else if (type == TILE_PARTITION) cout << "Tile wise partitioning..." << endl;
@@ -316,9 +375,9 @@ int main() {
         }
     } else {
         if (type == ELE_PARTITION) {
-            hipLaunchKernelGGL(matrixMul_colMajor_kernel, gridDim, blockDim, 0, 0, d_A, d_B, d_C, DIM1, DIM2, DIM3);
+            hipLaunchKernelGGL(matrixMul_colMajor_kernel2, gridDim, blockDim, 0, 0, d_A, d_B, d_C, DIM1, DIM2, DIM3);
         } else if (type == TILE_PARTITION) {
-            hipLaunchKernelGGL(matrixMul_colMajor_tiledKernel, gridDim, blockDim, 0, 0, d_A, d_B, d_C, DIM1, DIM2, DIM3);
+            hipLaunchKernelGGL(matrixMul_colMajor_tiledKernel2, gridDim, blockDim, 0, 0, d_A, d_B, d_C, DIM1, DIM2, DIM3);
         }
     }
     hipEventRecord(stopHip, 0);

@@ -2,6 +2,7 @@
 #include <hip/hip_runtime.h>
 
 int main() {
+	testste
     int deviceCount = 0;
     hipGetDeviceCount(&deviceCount);
 
